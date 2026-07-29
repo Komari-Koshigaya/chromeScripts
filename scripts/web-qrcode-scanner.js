@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         网页二维码扫描识别器
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  一键识别网页二维码，悬浮按钮可拖动，网址支持直接跳转，本地解析不上传图片
+// @version      1.3
+// @description  修复悬浮按钮闪烁；图片hover弹出扫码按钮；Alt+Q快捷键；整页扫码；弹窗宽度固定
 // @author       You
 // @match        *://*/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @require      https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js
 // ==/UserScript==
 
@@ -47,8 +48,8 @@
             border-radius:14px;
             box-shadow:0 4px 35px rgba(0,0,0,0.22);
             z-index:9999999;
-            min-width:420px;
-            max-width:90vw;
+            width: 460px;
+            max-width: 92vw;
             display:none;
         }
         #qrcode-mask {
@@ -100,15 +101,38 @@
             align-items:center;
             margin-bottom:12px;
         }
+        /* 悬浮扫码浮层 */
+        .global-img-scan-float{
+            position:fixed;
+            background:#2563eb;
+            color:#fff;
+            padding:4px 9px;
+            border-radius:6px;
+            font-size:12px;
+            cursor:pointer;
+            z-index:99999;
+            box-shadow:0 2px 8px #0003;
+            display:none;
+        }
     `);
 
-    // 创建悬浮扫码按钮
+    // 全局悬浮扫码按钮（右下角整页扫描）
     const scanBtn = document.createElement('button');
     scanBtn.id = "qrcode-scan-btn";
     scanBtn.textContent = "扫码";
     document.body.appendChild(scanBtn);
 
-    // ===== 拖拽逻辑 + 记忆位置 =====
+    // 悬浮在图片上方的【📷扫码】浮层
+    const floatScanBtn = document.createElement('div');
+    floatScanBtn.className = "global-img-scan-float";
+    floatScanBtn.innerText = "📷扫码";
+    document.body.appendChild(floatScanBtn);
+
+    let hoverTargetImg = null;
+    let lastRightClickImage = null;
+    let hideTimer = null; // 统一延时器
+
+    // ===== 拖拽记忆位置 =====
     let btnPos = GM_getValue("qrBtnPos", null);
     if(btnPos){
         scanBtn.style.left = btnPos.x + "px";
@@ -116,14 +140,12 @@
         scanBtn.style.right = "auto";
         scanBtn.style.bottom = "auto";
     }
-
     let isDrag = false;
     let offsetX, offsetY;
     scanBtn.onmousedown = (e)=>{
         isDrag = true;
         offsetX = e.clientX - scanBtn.getBoundingClientRect().left;
         offsetY = e.clientY - scanBtn.getBoundingClientRect().top;
-        e.preventDefault();
     };
     document.addEventListener("mousemove",(e)=>{
         if(!isDrag) return;
@@ -140,7 +162,7 @@
         }
     });
 
-    // 弹窗遮罩容器
+    // 弹窗容器
     const mask = document.createElement('div');
     mask.id = "qrcode-mask";
     const resultBox = document.createElement('div');
@@ -156,7 +178,6 @@
     `;
     document.body.append(mask, resultBox);
 
-    // 关闭弹窗
     const close = ()=>{
         mask.style.display = 'none';
         resultBox.style.display = 'none';
@@ -164,12 +185,11 @@
     mask.onclick = close;
     document.getElementById('qr-close').onclick = close;
 
-    // 判断文本是否为网址
     function isUrl(text){
         return /^(http|https):\/\/.+/.test(text.trim());
     }
 
-    // 解析单张图片二维码
+    // 解析图片二维码
     async function scanImage(imgEl) {
         return new Promise((resolve)=>{
             const canvas = document.createElement('canvas');
@@ -189,58 +209,126 @@
         });
     }
 
-    // 按钮点击扫描（区分拖拽和点击）
+    // 渲染弹窗
+    async function renderResult(list) {
+        const resultList = document.getElementById('qr-list');
+        mask.style.display = 'block';
+        resultBox.style.display = 'block';
+        if(list.length === 0){
+            resultList.innerHTML = "<p>未识别到二维码</p>";
+            return;
+        }
+        let html = "";
+        for(const text of list){
+            let displayText = escapeHtml(text);
+            if(isUrl(text)){
+                displayText = `<a target="_blank" href="${escapeHtml(text)}">${escapeHtml(text)}</a>`;
+            }
+            html += `<div class="qr-item"><span>${displayText}</span><button class="copy-btn" data-text="${escapeHtml(text)}">复制</button></div>`;
+        }
+        resultList.innerHTML = html;
+        document.querySelectorAll('.copy-btn').forEach(btn=>{
+            btn.onclick = async ()=>{
+                const t = btn.dataset.text;
+                await navigator.clipboard.writeText(t);
+                const old = btn.textContent;
+                btn.textContent = "已复制";
+                setTimeout(()=> btn.textContent = old, 1200);
+            }
+        })
+    }
+
+    // 浮层按钮点击识别当前图片
+    floatScanBtn.onclick = async (ev)=>{
+        ev.stopPropagation();
+        if(!hoverTargetImg) return;
+        const res = await scanImage(hoverTargetImg);
+        renderResult(res ? [res] : []);
+    };
+
+    // 鼠标悬浮在扫码按钮上，取消隐藏倒计时【关键防闪烁】
+    floatScanBtn.addEventListener('mouseenter', ()=>{
+        clearTimeout(hideTimer);
+    });
+    // 鼠标离开扫码按钮，启动隐藏倒计时
+    floatScanBtn.addEventListener('mouseleave', ()=>{
+        startHideTimer();
+    });
+
+    function startHideTimer(){
+        clearTimeout(hideTimer);
+        hideTimer = setTimeout(()=>{
+            floatScanBtn.style.display = "none";
+            hoverTargetImg = null;
+        }, 180);
+    }
+
+    // 右下角扫码按钮：扫描全部图片
     scanBtn.onclick = async ()=>{
         if(isDrag) return;
-        const images = document.querySelectorAll('img');
         const resultList = document.getElementById('qr-list');
         resultList.innerHTML = "<div>正在扫描页面所有图片...</div>";
         mask.style.display = 'block';
         resultBox.style.display = 'block';
-
+        const images = document.querySelectorAll('img');
         const found = [];
         for(const img of images) {
             if(img.naturalWidth <30 || img.naturalHeight<30) continue;
             const text = await scanImage(img);
             if(text && !found.includes(text)) found.push(text);
         }
-
-        if(found.length === 0){
-            resultList.innerHTML = "<p>页面图片内未识别到二维码</p>";
-            return;
-        }
-        let html = "";
-        for(const text of found){
-            let displayText = escapeHtml(text);
-            if(isUrl(text)){
-                displayText = `<a target="_blank" href="${escapeHtml(text)}">${escapeHtml(text)}</a>`;
-            }
-            html += `
-                <div class="qr-item">
-                    <span>${displayText}</span>
-                    <button class="copy-btn" data-text="${escapeHtml(text)}">复制</button>
-                </div>
-            `;
-        }
-        resultList.innerHTML = html;
-
-        // 复制按钮事件
-        document.querySelectorAll('.copy-btn').forEach(btn=>{
-            btn.onclick = async ()=>{
-                const t = btn.dataset.text;
-                await navigator.clipboard.writeText(t);
-                const originText = btn.textContent;
-                btn.textContent = "已复制";
-                setTimeout(()=>{
-                    btn.textContent = originText;
-                }, 1200);
-            }
-        })
+        renderResult(found);
     };
 
+    async function scanLastRightImage(){
+        if(!lastRightClickImage){
+            alert("请先在目标图片上点击鼠标右键！");
+            return;
+        }
+        const res = await scanImage(lastRightClickImage);
+        renderResult(res ? [res] : []);
+    }
+
+    GM_registerMenuCommand("识别上次右键图片二维码", scanLastRightImage);
+
+    // Alt+Q 快捷键
+    document.addEventListener('keydown', (e)=>{
+        if(e.altKey && e.key.toLowerCase() === 'q'){
+            e.preventDefault();
+            scanLastRightImage();
+        }
+    });
+
+    // 监听右键，记录图片
+    document.addEventListener("contextmenu", e=>{
+        let target = e.target;
+        while(target && target.tagName !== "IMG") target = target.parentElement;
+        lastRightClickImage = target;
+    });
+
+    // ========= 图片悬浮逻辑（修复闪烁核心） =========
+    document.addEventListener("mouseover", (e)=>{
+        let node = e.target;
+        while(node && node.tagName !== "IMG") node = node.parentElement;
+        if(node){
+            clearTimeout(hideTimer); // 清除隐藏计时器
+            hoverTargetImg = node;
+            const rect = node.getBoundingClientRect();
+            floatScanBtn.style.left = (rect.right - 70) + "px";
+            floatScanBtn.style.top = (rect.top + 6) + "px";
+            floatScanBtn.style.display = "block";
+        }
+    }, true);
+
+    document.addEventListener("mouseout", (e)=>{
+        let node = e.target;
+        while(node && node.tagName !== "IMG") node = node.parentElement;
+        if(node){
+            startHideTimer();
+        }
+    }, true);
+
     function escapeHtml(str){
-        return String(str).replace(/[&<>"']/g,m=>{
-            return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m];
-        })
+        return String(str).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[m]);
     }
 })();
